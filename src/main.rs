@@ -2,6 +2,7 @@
 
 mod code_assistant;
 mod tts_assistant;
+mod stt_assistant;
 
 use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
@@ -96,16 +97,19 @@ async fn chat() {
     // Assistants
     let mut speech_assistant = TtsAssistant::default();
     let mut code_assistant = CodeAssistant::new(home_dir);
+    let mut stt = stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-tiny.en.bin".to_string());
 
     // Turn-based
     loop {
         // User
         println!("\nYou: ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
+        // let mut input = String::new();
+        // std::io::stdin().read_line(&mut input).unwrap();
+        // let text = input.trim().to_string()
+        let text = stt.record();
         let prompt = ChatCompletionRequestMessage {
             role: Role::User,
-            content: input.trim().to_string(),
+            content: text,
             name: None,
         };
         chat_history.push(prompt);
