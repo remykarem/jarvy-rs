@@ -28,6 +28,9 @@ impl CodeAssistant {
         }
         self.flush_code_snippets();
     }
+    pub fn push(&mut self, chars: &[char]) {
+        self.snippets_buffer.push_back(chars.iter().collect());
+    }
     fn flush_code_snippets(&mut self) {
         while let Some(code_snippet) = self.snippets_buffer.pop_front() {
             let mut lines = code_snippet.lines();
@@ -82,38 +85,6 @@ impl CodeAssistant {
                     }
                 }
             }
-        }
-    }
-
-    pub fn process_token(&mut self, token: &str, last_char_in_speech_char_buffer: Option<char>) {
-        if self.char_buffer.is_empty() && token == "`" {
-            if let Some(ch) = last_char_in_speech_char_buffer {
-                // If the last character in token buffer is a backtick,
-                // then it's a code block
-                if ch == '`' {
-                    self.char_buffer.push('`');
-                    self.char_buffer.push('`');
-                }
-            }
-            // Temporarily append to main token buffer
-            // Treat it as a normal text
-        } else if self.char_buffer.is_empty() && token.starts_with('`') {
-            // Empty code buffer
-            self.char_buffer.extend(token.chars());
-        } else if self.char_buffer.len() == 2 && self.char_buffer[..2] == ['`', '`'] {
-            // self.char_buffer has `` in it
-            self.char_buffer.extend(token.chars());
-        } else if self.char_buffer.len() >= 3
-            && self.char_buffer[..3] == ['`', '`', '`']
-            && self.char_buffer[self.char_buffer.len() - 2..] == ['`', '`']
-            && token.starts_with('`')
-        {
-            // self.char_buffer has should be flushed in it
-            self.snippets_buffer
-                .push_back(self.char_buffer.iter().collect());
-            self.char_buffer.clear();
-        } else if !self.char_buffer.is_empty() {
-            self.char_buffer.extend(token.chars());
         }
     }
 }

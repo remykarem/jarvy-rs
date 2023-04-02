@@ -1,8 +1,8 @@
 #![deny(clippy::if_same_then_else)]
 
 mod code_assistant;
-mod tts_assistant;
 mod stt_assistant;
+mod tts_assistant;
 
 use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
@@ -15,7 +15,6 @@ use std::env;
 use std::error::Error;
 use std::io::{stdout, Write};
 use std::path::Path;
-
 
 async fn perform_request_with_streaming(
     chat_history: Vec<ChatCompletionRequestMessage>,
@@ -40,6 +39,12 @@ async fn perform_request_with_streaming(
     // Acquite the stdout lock to print the assistant's response
     let mut lock = stdout().lock();
 
+    let state = State::Prose;
+
+    let mut code_buffer = vec![];
+    let mut speech_buffer: Vec<char> = vec![];
+    let mut tmp_buffer = vec![];
+
     // Process the stream
     while let Some(result) = response.next().await {
         let mut response = result.expect("Error while reading response");
@@ -53,10 +58,36 @@ async fn perform_request_with_streaming(
             // Add the token to the current reply
             current_reply.push(token.clone());
 
-            // Do assistant tings
-            let last_speech_ch = speech_assistant.last_char_in_buffer();
-            code_assistant.process_token(token, last_speech_ch);
-            speech_assistant.process_token(token);
+            // Process token according to state
+            let (state, event) = transition(state, token, &code_buffer);
+            match (state, event) {
+                (State::Code, Event::Append) => {
+                    code_assistant.push(&token.chars().collect::<Vec<_>>());
+                    tmp_buffer.clear();
+                }
+                (State::Code, Event::Flush) => {
+                    code_assistant.push(&token.chars().collect::<Vec<_>>());
+                    code_assistant.flush();
+                    code_buffer.clear();
+                }
+                (State::Code, _) => {}
+
+                (State::Prose, Event::Append) => {
+                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
+                    tmp_buffer.clear();
+                }
+                (State::Prose, Event::Flush) => {
+                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
+                    speech_assistant.flush();
+                    speech_buffer.clear();
+                }
+                (State::Prose, _) => {}
+
+                (State::MaybeCode, Event::AppendTmp) => {
+                    tmp_buffer.extend(token.chars());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -97,7 +128,8 @@ async fn chat() {
     // Assistants
     let mut speech_assistant = TtsAssistant::default();
     let mut code_assistant = CodeAssistant::new(home_dir);
-    let mut stt = stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-tiny.en.bin".to_string());
+    let mut stt =
+        stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-tiny.en.bin".to_string());
 
     // Turn-based
     loop {
@@ -131,4 +163,103 @@ async fn main() -> Result<(), Box<dyn Error>> {
     chat().await;
 
     Ok(())
+}
+
+fn transition(from: State, token: &str, code_buffer: &[char]) -> (State, Event) {
+    match (from, token) {
+        (State::Code, token) => {
+            let token_backticks = token.chars().filter(|&x| x == '`').count();
+            let num_backticks = code_buffer.iter().filter(|&x| x == &'`').count();
+            if num_backticks + token_backticks == 6 {
+                (State::Prose, Event::Flush)
+            } else {
+                (State::Code, Event::Append)
+            }
+        }
+
+        (State::MaybeCode, "`" | "``") => (State::Code, Event::Append),
+        (State::MaybeCode, _) => (State::Prose, Event::Append),
+
+        (State::Prose, "`") => (State::MaybeCode, Event::AppendTmp),
+        (State::Prose, "``" | "```") => (State::Code, Event::Append),
+        (State::Prose, _) => (State::Prose, Event::Append),
+    }
+}
+
+fn should_flush() {}
+
+#[derive(PartialEq, Debug)]
+enum Event {
+    Flush,
+    Append,
+    AppendTmp,
+}
+
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum State {
+    Code,
+    MaybeCode,
+    Prose,
+}
+
+// transition tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_code_transition() {
+        assert_eq!(
+            transition(State::Code, "`", &['`']),
+            (State::Code, Event::Append)
+        );
+        assert_eq!(
+            transition(State::Code, "``", &['`']),
+            (State::Code, Event::Append)
+        );
+        assert_eq!(
+            transition(
+                State::Code,
+                "`",
+                "```code``".chars().collect::<Vec<_>>().as_slice()
+            ),
+            (State::Prose, Event::Flush)
+        );
+        assert_eq!(
+            transition(
+                State::Code,
+                "``",
+                "```code`".chars().collect::<Vec<_>>().as_slice()
+            ),
+            (State::Prose, Event::Flush)
+        );
+    }
+
+    #[test]
+    fn test_from_maybe_transition() {
+        assert_eq!(
+            transition(State::MaybeCode, "`", &['`']),
+            (State::Code, Event::Append)
+        );
+        assert_eq!(
+            transition(State::MaybeCode, "``", &['`']),
+            (State::Code, Event::Append)
+        );
+        assert_eq!(
+            transition(State::MaybeCode, "a", &['`']),
+            (State::Prose, Event::Append)
+        );
+    }
+
+    #[test]
+    fn test_prose_transition() {
+        assert_eq!(
+            transition(State::Prose, "`", &[]),
+            (State::MaybeCode, Event::AppendTmp)
+        );
+        assert_eq!(
+            transition(State::Prose, "`", &['a']),
+            (State::MaybeCode, Event::AppendTmp)
+        );
+    }
 }
