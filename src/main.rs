@@ -12,6 +12,134 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+fn flush_code_snippet(code_snippet: String, home_dir: PathBuf) {
+    let mut lines = code_snippet.lines();
+    let language_and_filename = lines.next().unwrap().trim_start_matches("```").to_string();
+    let mut file_details = language_and_filename
+        .split('-')
+        .map(|s| s.trim())
+        .collect::<Vec<_>>();
+
+    let (language, filename) = if file_details.len() == 2 {
+        (file_details.remove(0), Some(file_details.remove(0)))
+    } else {
+        (file_details[0], None)
+    };
+
+    let code = lines.collect::<Vec<_>>().join("\n");
+        
+    if let Some(filename) = filename {
+        let filepath = home_dir.join(filename);
+        std::fs::write(filepath, code).unwrap();
+    } else {
+        let mut is_file = String::new();
+        loop {
+            println!("file or shell or drop? ");
+            std::io::stdin().read_line(&mut is_file).unwrap();
+            is_file = is_file.trim().to_string();
+            if is_file == "file" {
+                let mut filename = String::new();
+                println!("filename? ");
+                std::io::stdin().read_line(&mut filename).unwrap();
+                let filepath = home_dir.join(filename.trim());
+                std::fs::write(filepath, code).unwrap();
+                break;
+            } else if is_file == "shell" {
+                // Blocking call
+                let output = Command::new("sh").arg("-c").arg(&code).output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let _stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let exit_code = output.status.code().unwrap_or(-1);
+                println!("{} {}", exit_code, stdout);
+
+                // Break so that we can give (negative) feedback to the model
+                // Otherwise, the model will keep on generating
+                // and we won't be able to see the output
+                if exit_code == 0 {
+                    // Continue execution
+                } else {
+                    break;
+                }
+            } else {
+                // Keep asking for input
+            }
+        }
+    }
+}
+
+fn process_token_for_speech(
+    token: &str,
+    token_buffer: &mut Vec<char>,
+    buffer_sentences: &mut VecDeque<String>,
+    process: &mut std::process::Child,
+) {
+    if token.starts_with(&['.', ':', '\n', '!', '?'][..])
+        || token.ends_with(&['.', ':', '\n', '!', '?'][..])
+    {
+        // Concatenate, then say the sentence using macOS's say command
+        let sentence = token_buffer.iter().collect::<String>();
+        token_buffer.clear();
+
+        buffer_sentences.push_back(sentence);
+
+        if let Some(_exit_status) = process.try_wait().unwrap() {
+            if !buffer_sentences.is_empty() {
+                let say_sentence = buffer_sentences.drain(..).collect::<Vec<String>>().join("");
+                *process = Command::new("say")
+                    .arg("-r")
+                    .arg("200")
+                    .arg("-v")
+                    .arg("samantha")
+                    .arg(&say_sentence)
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                buffer_sentences.clear();
+            }
+        }
+    } else {
+        // If the token is not a period, append it to the buffer
+        token_buffer.extend(token.chars());
+    }
+}
+
+fn process_token_for_code(
+    token: &str,
+    code_token_buffer: &mut Vec<char>,
+    token_buffer: &mut Vec<char>,
+    code_snippets: &mut VecDeque<String>,
+) {
+    if code_token_buffer.is_empty() && token == "`" {
+        if let Some(last_char) = token_buffer.last() {
+            if last_char == &'`' {
+                // If the last character in token buffer is a backtick,
+                // then it's a code block
+                token_buffer.pop();
+                code_token_buffer.push('`');
+                code_token_buffer.push('`');
+            }
+        }
+        // Temporarily append to main token buffer
+        // Treat it as a normal text
+    } else if code_token_buffer.is_empty() && token.starts_with('`') {
+        // Empty code buffer
+        code_token_buffer.extend(token.chars());
+    } else if code_token_buffer.len() == 2 && code_token_buffer[..2] == ['`', '`'] {
+        // code_token_buffer has `` in it
+        code_token_buffer.extend(token.chars());
+    } else if code_token_buffer.len() >= 3
+        && code_token_buffer[..3] == ['`', '`', '`']
+        && code_token_buffer[code_token_buffer.len() - 2..] == ['`', '`']
+        && token.starts_with('`')
+    {
+        // code_token_buffer has should be flushed in it
+        code_snippets.push_back(code_token_buffer.iter().collect());
+        code_token_buffer.clear();
+    } else if !code_token_buffer.is_empty() {
+        code_token_buffer.extend(token.chars());
+    }
+}
+
 async fn perform_request_with_streaming(
     home_dir: PathBuf,
     chat_history: Vec<ChatCompletionRequestMessage>,
@@ -54,71 +182,20 @@ async fn perform_request_with_streaming(
             current_reply.push(token.clone());
 
             // Code assistance
-            if code_token_buffer.is_empty() && token == "`" {
-                if let Some(last_char) = token_buffer.last() {
-                    if last_char == &'`' {
-                        // If the last character in token buffer is a backtick,
-                        // then it's a code block
-                        token_buffer.pop();
-                        code_token_buffer.push('`');
-                        code_token_buffer.push('`');
-                        continue;
-                    }
-                }
-                // Temporarily append to main token buffer
-                // Treat it as a normal text
-            } else if code_token_buffer.is_empty() && token.starts_with('`') {
-                // Empty code buffer
-                code_token_buffer.extend(token.chars());
-                continue;
-            } else if code_token_buffer.len() == 2 && code_token_buffer[..2] == ['`', '`'] {
-                // code_token_buffer has `` in it
-                code_token_buffer.extend(token.chars());
-                continue;
-            } else if code_token_buffer.len() >= 3
-                && code_token_buffer[..3] == ['`', '`', '`']
-                && code_token_buffer[code_token_buffer.len() - 2..] == ['`', '`']
-                && token.starts_with('`')
-            {
-                // code_token_buffer has should be flushed in it
-                code_snippets.push_back(code_token_buffer.iter().collect());
-                code_token_buffer.clear();
-                continue;
-            } else if !code_token_buffer.is_empty() {
-                code_token_buffer.extend(token.chars());
-                continue;
-            }
+            process_token_for_code(
+                token,
+                &mut code_token_buffer,
+                &mut token_buffer,
+                &mut code_snippets,
+            );
 
             // Speech synthesis
-            if token.starts_with(&['.', ':', '\n', '!', '?'][..])
-                || token.ends_with(&['.', ':', '\n', '!', '?'][..])
-            {
-                // Concatenate, then say the sentence using macOS's say command
-                let sentence = token_buffer.iter().collect::<String>();
-                token_buffer.clear();
-
-                buffer_sentences.push_back(sentence);
-
-                if let Some(_exit_status) = process.try_wait().unwrap() {
-                    if !buffer_sentences.is_empty() {
-                        let say_sentence =
-                            buffer_sentences.drain(..).collect::<Vec<String>>().join("");
-                        process = Command::new("say")
-                            .arg("-r")
-                            .arg("200")
-                            .arg("-v")
-                            .arg("samantha")
-                            .arg(&say_sentence)
-                            .stdout(Stdio::null())
-                            .spawn()
-                            .unwrap();
-                        buffer_sentences.clear();
-                    }
-                }
-            } else {
-                // If the token is not a period, append it to the buffer
-                token_buffer.extend(token.chars());
-            }
+            process_token_for_speech(
+                token,
+                &mut token_buffer,
+                &mut buffer_sentences,
+                &mut process,
+            );
         }
     }
 
@@ -130,74 +207,7 @@ async fn perform_request_with_streaming(
 
     // If there are any code snippets, execute them first
     while let Some(code_snippet) = code_snippets.pop_front() {
-        let mut lines = code_snippet.lines();
-        let language_and_filename = lines.next().unwrap().trim_start_matches("```").to_string();
-        let mut file_details = language_and_filename
-            .split('-')
-            .map(|s| s.trim())
-            .collect::<Vec<_>>();
-
-        let (language, filename) = if file_details.len() == 2 {
-            (file_details.remove(0), Some(file_details.remove(0)))
-        } else {
-            (file_details[0], None)
-        };
-
-        let code = lines.collect::<Vec<_>>().join("\n");
-
-        if language == "bash" {
-            // Blocking call
-            let output = Command::new("sh").arg("-c").arg(&code).output().unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let _stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let exit_code = output.status.code().unwrap_or(-1);
-            println!("{} {}", exit_code, stdout);
-
-            // Break so that we can give (negative) feedback to the model
-            // Otherwise, the model will keep on generating
-            // and we won't be able to see the output
-            if exit_code == 0 {
-                // Continue execution
-            } else {
-                break;
-            }
-        } else if let Some(filename) = filename {
-            let filepath = home_dir.join(filename);
-            std::fs::write(filepath, code).unwrap();
-        } else {
-            let mut is_file = String::new();
-            loop {
-                println!("file or shell or drop? ");
-                std::io::stdin().read_line(&mut is_file).unwrap();
-                is_file = is_file.trim().to_string();
-                if is_file == "file" {
-                    let mut filename = String::new();
-                    println!("filename? ");
-                    std::io::stdin().read_line(&mut filename).unwrap();
-                    let filepath = home_dir.join(filename.trim());
-                    std::fs::write(filepath, code).unwrap();
-                    break;
-                } else if is_file == "shell" {
-                    // Blocking call
-                    let output = Command::new("sh").arg("-c").arg(&code).output().unwrap();
-                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let _stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let exit_code = output.status.code().unwrap_or(-1);
-                    println!("{} {}", exit_code, stdout);
-
-                    // Break so that we can give (negative) feedback to the model
-                    // Otherwise, the model will keep on generating
-                    // and we won't be able to see the output
-                    if exit_code == 0 {
-                        // Continue execution
-                    } else {
-                        break;
-                    }
-                } else {
-                    // Keep asking for input
-                }
-            }
-        }
+        flush_code_snippet(code_snippet, home_dir.to_path_buf())
     }
 
     // If there are any sentences left in the buffer, say them
