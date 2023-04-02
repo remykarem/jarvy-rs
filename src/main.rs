@@ -1,11 +1,9 @@
 #![deny(clippy::if_same_then_else)]
 
-use async_openai::types::ChatCompletionRequestMessageArgs;
+use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_openai::types::Role;
 use futures::StreamExt;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
@@ -14,42 +12,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct ChatRequestBody {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: i32,
-    stream: bool,
-}
-
-#[derive(Deserialize)]
-struct ChatResponseDelta {
-    content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatResponseChoice {
-    delta: ChatResponseDelta,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatResponseChoice>,
-}
-
 async fn perform_request_with_streaming(
     home_dir: PathBuf,
-    exit_code: i32,
-    output: String,
-    context: String,
-    language: String,
-) -> (i32, String) {
+    chat_history: Vec<ChatCompletionRequestMessage>,
+) -> ChatCompletionRequestMessage {
     // For speech synthesis
     let mut token_buffer: Vec<char> = Vec::new();
     let mut buffer_sentences: VecDeque<String> = VecDeque::new();
@@ -59,80 +25,30 @@ async fn perform_request_with_streaming(
     let mut code_token_buffer: Vec<char> = Vec::new();
     let mut code_snippets: VecDeque<String> = VecDeque::new();
 
-    // To save the current reply and add to the chat history
-    let mut current_reply = Vec::new();
+    // To save the current reply
+    let mut current_reply: Vec<String> = Vec::new();
 
     // Set up the request
-    let url = "https://api.openai.com/v1/chat/completions";
-
-    let prompt = if exit_code == 0 {
-        let raw_prompt = if !context.is_empty() {
-            println!("\nYou (with context): ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            format!("{}\n\n```{}\n{}\n```", input.trim(), language, context)
-        } else {
-            println!("\nYou: ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
-        };
-        ChatMessage {
-            role: "user".to_string(),
-            content: raw_prompt,
-        }
-    } else {
-        ChatMessage {
-            role: "user".to_string(),
-            content: format!("I'm getting the following: ```\n{}\n```", output),
-        }
-    };
-
-    let chat_history = vec![prompt];
-
-    let mut headers = reqwest::header::HeaderMap::new();
-
-    headers.insert(
-        reqwest::header::ACCEPT,
-        "text/event-stream".parse().unwrap(),
-    );
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {}", API_KEY).parse().unwrap(),
-    );
-
-    let body = ChatRequestBody {
-        model: "gpt-3.5-turbo".to_string(),
-        messages: chat_history,
-        temperature: 0,
-        stream: true,
-    };
-
-    let mut response = Client::new()
-        .post(url)
-        .json(&body)
-        .headers(headers)
-        .send()
-        .await
+    let request = CreateChatCompletionRequestArgs::default()
+        .model("gpt-3.5-turbo")
+        .messages(chat_history)
+        .stream(true)
+        .build()
         .unwrap();
 
+    let client = async_openai::Client::new();
+    let mut response = client.chat().create_stream(request).await.unwrap();
+
+    let mut lock = stdout().lock();
+
     print!("\nAssistant: ");
-    while let Some(chunk) = response.chunk().await.unwrap() {
-        let line = String::from_utf8_lossy(&chunk);
+    while let Some(result) = response.next().await {
+        let mut response = result.expect("Error while reading response");
+        let something = response.choices.pop().unwrap();
 
-        let line = line.trim_start_matches("data: ");
-
-        if line == "[DONE]" {
-            break;
-        }
-
-        println!("yooo{}yooo", line);
-        let ChatResponse { mut choices } = serde_json::from_str(line.trim()).unwrap();
-
-        let ChatResponseChoice { delta } = choices.pop().unwrap();
-
-        if let Some(token) = delta.content {
-            print!("{}", token);
+        if let Some(ref token) = something.delta.content {
+            write!(lock, "{}", token).unwrap();
+            stdout().flush().unwrap();
 
             // Add the token to the current reply
             current_reply.push(token.clone());
@@ -169,13 +85,7 @@ async fn perform_request_with_streaming(
                 code_token_buffer.clear();
                 continue;
             } else if !code_token_buffer.is_empty() {
-                if token.starts_with('`') {
-                    code_token_buffer.extend(token.chars());
-                } else {
-                    for c in token.chars() {
-                        code_token_buffer.push(c);
-                    }
-                }
+                code_token_buffer.extend(token.chars());
                 continue;
             }
 
@@ -207,9 +117,7 @@ async fn perform_request_with_streaming(
                 }
             } else {
                 // If the token is not a period, append it to the buffer
-                for c in token.chars() {
-                    token_buffer.push(c);
-                }
+                token_buffer.extend(token.chars());
             }
         }
     }
@@ -307,95 +215,56 @@ async fn perform_request_with_streaming(
     }
 
     // Append the current reply to the chat history and clear the current reply
-    let _chat_history = vec![ChatMessage {
-        role: "assistant".to_string(),
+    ChatCompletionRequestMessage {
+        role: Role::Assistant,
         content: current_reply.join(""),
-    }];
-    // TODO: Add chat history to some persistent storage
-
-    current_reply.clear();
-
-    (exit_code, output)
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // create client, reads OPENAI_API_KEY environment variable for API key.
-    let client = async_openai::Client::new();
-
-    let request = CreateChatCompletionRequestArgs::default()
-        .model("gpt-3.5-turbo")
-        .messages([ChatCompletionRequestMessageArgs::default()
-            .content("What is pin and unpin in rust eli5")
-            .role(Role::User)
-            .build()?])
-        .stream(true)
-        .build()?;
-
-    let mut stream = client.chat().create_stream(request).await?;
-
-    let mut lock = stdout().lock();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(response) => {
-                response.choices.iter().for_each(|chat_choice| {
-                    if let Some(ref content) = chat_choice.delta.content {
-                        write!(lock, "{}", content).unwrap();
-                    }
-                });
-            }
-            Err(err) => {
-                writeln!(lock, "error: {err}").unwrap();
-            }
-        }
-        stdout().flush()?;
+        name: None,
     }
-
-    Ok(())
 }
 
 async fn chat() {
     let args: Vec<String> = env::args().collect();
 
+    let mut chat_history: Vec<_> = vec![ChatCompletionRequestMessage {
+        role: Role::System,
+        content: r#"You are going to be pair-programme with me. I need you to be less verbose in your explanations. 
+    
+        I need you to provide me at most one code block. 
+            
+        Please specify the language and the filename of the code block at the backticks
+        
+        ```<language>-<filename>
+        <code> 
+        ```.
+        
+            Most of the time we'll be working with one file at a time, represented by a code block. Changes to a code block should be rewritten entirely. Any suggestions or questions you have, please ask me. I'll be happy to answer them. Let's get started!"#.into(),
+        name: None,
+    }];
+
     let home_dir = Path::new(&args[1]);
     std::fs::create_dir_all(home_dir).expect("Could not create home directory");
 
-    let (mut shared_file, mut context, mut language) = (None, String::new(), String::new());
-
-    // If there are 2 args, the 2nd arg is the file
-    if args.len() >= 3 {
-        shared_file = Some(Path::new(&args[2]));
-        if let Some(file) = shared_file {
-            if !file.exists() {
-                println!("File {} does not exist", file.display());
-                std::process::exit(1);
-            }
-            context = std::fs::read_to_string(file).unwrap_or_default();
-            language = args[3].clone();
-        }
-    }
-
-    let mut exit_code = 0;
-    let mut output = String::new();
-
     loop {
-        match perform_request_with_streaming(
-            home_dir.to_path_buf(),
-            exit_code,
-            output.clone(),
-            context.clone(),
-            language.clone(),
-        )
-        .await
-        {
-            (code, out) => {
-                exit_code = code;
-                output = out;
-            }
-            _ => {
-                exit_code = 0;
-                output = String::new();
-            }
-        }
+        println!("\nYou: ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        let prompt = ChatCompletionRequestMessage {
+            role: Role::User,
+            content: input.trim().to_string(),
+            name: None,
+        };
+        chat_history.push(prompt);
+
+        let reply =
+            perform_request_with_streaming(home_dir.to_path_buf(), chat_history.clone()).await;
+
+        chat_history.push(reply);
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    chat().await;
+
+    Ok(())
 }
