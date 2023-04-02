@@ -1,158 +1,26 @@
 #![deny(clippy::if_same_then_else)]
 
+mod code_assistant;
+mod tts_assistant;
+
 use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_openai::types::Role;
+use code_assistant::CodeAssistant;
 use futures::StreamExt;
-use std::collections::VecDeque;
+use tts_assistant::TtsAssistant;
+
 use std::env;
 use std::error::Error;
 use std::io::{stdout, Write};
 use std::path::Path;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-fn flush_code_snippet(code_snippet: String, home_dir: PathBuf) {
-    let mut lines = code_snippet.lines();
-    let language_and_filename = lines.next().unwrap().trim_start_matches("```").to_string();
-    let mut file_details = language_and_filename
-        .split('-')
-        .map(|s| s.trim())
-        .collect::<Vec<_>>();
-
-    let (language, filename) = if file_details.len() == 2 {
-        (file_details.remove(0), Some(file_details.remove(0)))
-    } else {
-        (file_details[0], None)
-    };
-
-    let code = lines.collect::<Vec<_>>().join("\n");
-        
-    if let Some(filename) = filename {
-        let filepath = home_dir.join(filename);
-        std::fs::write(filepath, code).unwrap();
-    } else {
-        let mut is_file = String::new();
-        loop {
-            println!("file or shell or drop? ");
-            std::io::stdin().read_line(&mut is_file).unwrap();
-            is_file = is_file.trim().to_string();
-            if is_file == "file" {
-                let mut filename = String::new();
-                println!("filename? ");
-                std::io::stdin().read_line(&mut filename).unwrap();
-                let filepath = home_dir.join(filename.trim());
-                std::fs::write(filepath, code).unwrap();
-                break;
-            } else if is_file == "shell" {
-                // Blocking call
-                let output = Command::new("sh").arg("-c").arg(&code).output().unwrap();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let _stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let exit_code = output.status.code().unwrap_or(-1);
-                println!("{} {}", exit_code, stdout);
-
-                // Break so that we can give (negative) feedback to the model
-                // Otherwise, the model will keep on generating
-                // and we won't be able to see the output
-                if exit_code == 0 {
-                    // Continue execution
-                } else {
-                    break;
-                }
-            } else {
-                // Keep asking for input
-            }
-        }
-    }
-}
-
-fn process_token_for_speech(
-    token: &str,
-    token_buffer: &mut Vec<char>,
-    buffer_sentences: &mut VecDeque<String>,
-    process: &mut std::process::Child,
-) {
-    if token.starts_with(&['.', ':', '\n', '!', '?'][..])
-        || token.ends_with(&['.', ':', '\n', '!', '?'][..])
-    {
-        // Concatenate, then say the sentence using macOS's say command
-        let sentence = token_buffer.iter().collect::<String>();
-        token_buffer.clear();
-
-        buffer_sentences.push_back(sentence);
-
-        if let Some(_exit_status) = process.try_wait().unwrap() {
-            if !buffer_sentences.is_empty() {
-                let say_sentence = buffer_sentences.drain(..).collect::<Vec<String>>().join("");
-                *process = Command::new("say")
-                    .arg("-r")
-                    .arg("200")
-                    .arg("-v")
-                    .arg("samantha")
-                    .arg(&say_sentence)
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap();
-                buffer_sentences.clear();
-            }
-        }
-    } else {
-        // If the token is not a period, append it to the buffer
-        token_buffer.extend(token.chars());
-    }
-}
-
-fn process_token_for_code(
-    token: &str,
-    code_token_buffer: &mut Vec<char>,
-    token_buffer: &mut Vec<char>,
-    code_snippets: &mut VecDeque<String>,
-) {
-    if code_token_buffer.is_empty() && token == "`" {
-        if let Some(last_char) = token_buffer.last() {
-            if last_char == &'`' {
-                // If the last character in token buffer is a backtick,
-                // then it's a code block
-                token_buffer.pop();
-                code_token_buffer.push('`');
-                code_token_buffer.push('`');
-            }
-        }
-        // Temporarily append to main token buffer
-        // Treat it as a normal text
-    } else if code_token_buffer.is_empty() && token.starts_with('`') {
-        // Empty code buffer
-        code_token_buffer.extend(token.chars());
-    } else if code_token_buffer.len() == 2 && code_token_buffer[..2] == ['`', '`'] {
-        // code_token_buffer has `` in it
-        code_token_buffer.extend(token.chars());
-    } else if code_token_buffer.len() >= 3
-        && code_token_buffer[..3] == ['`', '`', '`']
-        && code_token_buffer[code_token_buffer.len() - 2..] == ['`', '`']
-        && token.starts_with('`')
-    {
-        // code_token_buffer has should be flushed in it
-        code_snippets.push_back(code_token_buffer.iter().collect());
-        code_token_buffer.clear();
-    } else if !code_token_buffer.is_empty() {
-        code_token_buffer.extend(token.chars());
-    }
-}
 
 async fn perform_request_with_streaming(
-    home_dir: PathBuf,
     chat_history: Vec<ChatCompletionRequestMessage>,
+    speech_assistant: &mut TtsAssistant,
+    code_assistant: &mut CodeAssistant,
 ) -> ChatCompletionRequestMessage {
-    // For speech synthesis
-    let mut token_buffer: Vec<char> = Vec::new();
-    let mut buffer_sentences: VecDeque<String> = VecDeque::new();
-    let mut process = Command::new("echo").stdout(Stdio::piped()).spawn().unwrap();
-
-    // For code assistance
-    let mut code_token_buffer: Vec<char> = Vec::new();
-    let mut code_snippets: VecDeque<String> = VecDeque::new();
-
     // To save the current reply
     let mut current_reply: Vec<String> = Vec::new();
 
@@ -164,65 +32,36 @@ async fn perform_request_with_streaming(
         .build()
         .unwrap();
 
+    // Make the request
     let client = async_openai::Client::new();
     let mut response = client.chat().create_stream(request).await.unwrap();
 
+    // Acquite the stdout lock to print the assistant's response
     let mut lock = stdout().lock();
 
-    print!("\nAssistant: ");
+    // Process the stream
     while let Some(result) = response.next().await {
         let mut response = result.expect("Error while reading response");
         let something = response.choices.pop().unwrap();
 
         if let Some(ref token) = something.delta.content {
+            // Display the token
             write!(lock, "{}", token).unwrap();
             stdout().flush().unwrap();
 
             // Add the token to the current reply
             current_reply.push(token.clone());
 
-            // Code assistance
-            process_token_for_code(
-                token,
-                &mut code_token_buffer,
-                &mut token_buffer,
-                &mut code_snippets,
-            );
-
-            // Speech synthesis
-            process_token_for_speech(
-                token,
-                &mut token_buffer,
-                &mut buffer_sentences,
-                &mut process,
-            );
+            // Do assistant tings
+            let last_speech_ch = speech_assistant.last_char_in_buffer();
+            code_assistant.process_token(token, last_speech_ch);
+            speech_assistant.process_token(token);
         }
     }
 
     // Flush any remaining buffer
-    if !code_token_buffer.is_empty() {
-        code_snippets.push_back(code_token_buffer.iter().collect());
-        code_token_buffer.clear();
-    }
-
-    // If there are any code snippets, execute them first
-    while let Some(code_snippet) = code_snippets.pop_front() {
-        flush_code_snippet(code_snippet, home_dir.to_path_buf())
-    }
-
-    // If there are any sentences left in the buffer, say them
-    while let Some(sentence) = buffer_sentences.pop_front() {
-        process.wait().unwrap();
-        process = Command::new("say")
-            .arg("-r")
-            .arg("200")
-            .arg("-v")
-            .arg("samantha")
-            .arg(&sentence)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-    }
+    code_assistant.flush();
+    speech_assistant.flush();
 
     // Append the current reply to the chat history and clear the current reply
     ChatCompletionRequestMessage {
@@ -233,8 +72,11 @@ async fn perform_request_with_streaming(
 }
 
 async fn chat() {
+    // Environment
     let args: Vec<String> = env::args().collect();
+    let home_dir = Path::new(&args[1]).to_path_buf();
 
+    // Initial intent
     let mut chat_history: Vec<_> = vec![ChatCompletionRequestMessage {
         role: Role::System,
         content: r#"You are going to be pair-programme with me. I need you to be less verbose in your explanations. 
@@ -251,10 +93,13 @@ async fn chat() {
         name: None,
     }];
 
-    let home_dir = Path::new(&args[1]);
-    std::fs::create_dir_all(home_dir).expect("Could not create home directory");
+    // Assistants
+    let mut speech_assistant = TtsAssistant::default();
+    let mut code_assistant = CodeAssistant::new(home_dir);
 
+    // Turn-based
     loop {
+        // User
         println!("\nYou: ");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
@@ -265,9 +110,14 @@ async fn chat() {
         };
         chat_history.push(prompt);
 
-        let reply =
-            perform_request_with_streaming(home_dir.to_path_buf(), chat_history.clone()).await;
-
+        // Assistant
+        print!("\nAssistant: ");
+        let reply = perform_request_with_streaming(
+            chat_history.clone(),
+            &mut speech_assistant,
+            &mut code_assistant,
+        )
+        .await;
         chat_history.push(reply);
     }
 }
