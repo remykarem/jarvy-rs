@@ -142,7 +142,7 @@ impl GetInput for Stt {
             })
             .filter(|segment| segment != "[BLANK_AUDIO]")
             .collect::<Vec<String>>()
-            .join("")
+            .join(" ")
     }
 }
 
