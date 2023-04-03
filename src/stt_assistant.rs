@@ -1,15 +1,16 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::Stream;
+use cpal::{Stream, StreamConfig};
 use rubato::{InterpolationParameters, InterpolationType, Resampler, SincFixedIn, WindowFunction};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 use whisper_rs::{convert_stereo_to_mono_audio, FullParams, SamplingStrategy, WhisperContext};
 
+use crate::traits::GetInput;
+
 const VOLUME_THRESHOLD: f32 = 0.05;
 const SILENCE_DURATION: Duration = Duration::from_secs(2);
 const AUDIO_BUFFER: usize = 512;
-const INPUT_SAMPLE_RATE: usize = 44_100;
-const OUTPUT_SAMPLE_RATE: usize = 16_000;
+const OUTPUT_SAMPLE_RATE: usize = 16_000;  // as required by Whisper
 
 pub struct Stt {
     ctx: WhisperContext,
@@ -19,15 +20,19 @@ pub struct Stt {
 }
 
 fn audio_input_stream_data_callback(
+    n_channels: usize,
     raw_stereo_samples: &[f32],
     tx: &SyncSender<f32>,
     resampler: &mut SincFixedIn<f32>,
 ) {
     // Convert stereo to mono
-    let raw_mono_samples: Vec<f32> = convert_stereo_to_mono_audio(raw_stereo_samples).unwrap();
-
-    // Resample the audio to get the target sample rate
-    let mut mono_samples = resampler.process(&[raw_mono_samples], None).unwrap();
+    let mut mono_samples = if n_channels == 2 {
+        let raw_mono_samples = convert_stereo_to_mono_audio(raw_stereo_samples).unwrap();
+        // Resample the audio to get the target sample rate
+        resampler.process(&[raw_mono_samples], None).unwrap()
+    } else {
+        resampler.process(&[raw_stereo_samples], None).unwrap()
+    };
 
     // Send the audio to the main thread
     mono_samples.pop().unwrap().into_iter().for_each(|sample| {
@@ -46,7 +51,7 @@ fn create_paused_audio_stream(tx: SyncSender<f32>) -> Stream {
 
     // Configure the input stream with default format
     // We want to use the default format
-    let input_config = input_device
+    let input_config: StreamConfig = input_device
         .supported_input_configs()
         .expect("No supported input config found")
         .next()
@@ -55,15 +60,17 @@ fn create_paused_audio_stream(tx: SyncSender<f32>) -> Stream {
         .into();
     println!("Input config: {:?}", input_config);
 
+    let n_channels = input_config.channels as usize;
+
     // Create resampler to convert the audio from the input device's sample rate to 16 kHz
     let mut mono_resampler = SincFixedIn::<f32>::new(
-        OUTPUT_SAMPLE_RATE as f64 / INPUT_SAMPLE_RATE as f64,
+        OUTPUT_SAMPLE_RATE as f64 / input_config.sample_rate.0 as f64,
         2.0,
         InterpolationParameters {
             sinc_len: 128,
             f_cutoff: 0.95,
             interpolation: InterpolationType::Linear,
-            oversampling_factor: 256,
+            oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
         },
         AUDIO_BUFFER,
@@ -76,7 +83,7 @@ fn create_paused_audio_stream(tx: SyncSender<f32>) -> Stream {
         .build_input_stream(
             &input_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                audio_input_stream_data_callback(data, &tx, &mut mono_resampler);
+                audio_input_stream_data_callback(n_channels, data, &tx, &mut mono_resampler);
             },
             move |err| eprintln!("An error occurred on the input audio stream: {}", err),
             None,
@@ -89,34 +96,9 @@ fn create_paused_audio_stream(tx: SyncSender<f32>) -> Stream {
     stream
 }
 
-impl Stt {
-    pub fn new(path_to_model: String) -> Self {
-        let ctx = WhisperContext::new(&path_to_model).expect("failed to load model");
-
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-        params.set_n_threads(1);
-        params.set_translate(true);
-        params.set_language(Some("en"));
-        params.set_print_special(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-
-        let (tx, audio_receiver) = mpsc::sync_channel(AUDIO_BUFFER);
-
-        // Create an audio stream
-        let stream = create_paused_audio_stream(tx);
-
-        Self {
-            ctx,
-            audio_data: Vec::new(),
-            audio_receiver,
-            stream,
-        }
-    }
-
+impl GetInput for Stt {
     /// Record until no voice activity is detected, then output the text.
-    pub fn record(&mut self) -> String {
+    fn record(&mut self) -> String {
         // Start recording
         println!("Start recording");
         self.stream.play().expect("Failed to start recording");
@@ -161,6 +143,33 @@ impl Stt {
             .filter(|segment| segment != "[BLANK_AUDIO]")
             .collect::<Vec<String>>()
             .join("")
+    }
+}
+
+impl Stt {
+    pub fn new(path_to_model: String) -> Self {
+        let ctx = WhisperContext::new(&path_to_model).expect("failed to load model");
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+        params.set_n_threads(1);
+        params.set_translate(true);
+        params.set_language(Some("en"));
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+
+        let (tx, audio_receiver) = mpsc::sync_channel(AUDIO_BUFFER);
+
+        // Create an audio stream
+        let stream = create_paused_audio_stream(tx);
+
+        Self {
+            ctx,
+            audio_data: Vec::new(),
+            audio_receiver,
+            stream,
+        }
     }
 
     pub fn record_streaming() -> String {
