@@ -5,6 +5,7 @@ mod stt_assistant;
 mod tts_assistant;
 mod traits;
 mod tty_input;
+mod tts_assistant2;
 
 use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
@@ -85,7 +86,9 @@ async fn perform_request_with_streaming(
                     speech_assistant.flush();
                     speech_buffer.clear();
                 }
-                (State::Prose, _) => {}
+                (State::Prose, _) => {
+                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
+                }
 
                 (State::MaybeCode, Event::AppendTmp) => {
                     tmp_buffer.extend(token.chars());
@@ -184,6 +187,7 @@ fn transition(from: State, token: &str, code_buffer: &[char]) -> (State, Event) 
 
         (State::Prose, "`") => (State::MaybeCode, Event::AppendTmp),
         (State::Prose, "``" | "```") => (State::Code, Event::Append),
+        (State::Prose, ".") => (State::Prose, Event::Flush),
         (State::Prose, _) => (State::Prose, Event::Append),
     }
 }

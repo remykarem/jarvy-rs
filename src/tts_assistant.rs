@@ -31,9 +31,12 @@ impl TtsAssistant {
             .unwrap();
     }
     pub fn flush(&mut self) {
-        while let Some(sentence) = self.sentence_buffer.pop_front() {
-            self.say(&sentence);
-        }
+        let sentences = self
+            .sentence_buffer
+            .drain(..)
+            .collect::<Vec<String>>()
+            .join("");
+        self.say(&sentences);
     }
     pub fn push(&mut self, chars: &[char]) {
         self.sentence_buffer.push_back(chars.iter().collect());
