@@ -13,6 +13,7 @@ use async_openai::types::Role;
 use code_assistant::CodeAssistant;
 use futures::StreamExt;
 use tts_assistant::TtsAssistant;
+use tts_assistant2::TtsAssistant2;
 
 use std::env;
 use std::error::Error;
@@ -21,9 +22,15 @@ use std::path::Path;
 
 use crate::traits::GetInput;
 
+macro_rules! char_vec {
+    ($s:expr) => {{
+        $s.chars().collect::<Vec<_>>()
+    }};
+}
+
 async fn perform_request_with_streaming(
     chat_history: Vec<ChatCompletionRequestMessage>,
-    speech_assistant: &mut TtsAssistant,
+    speech_assistant: &mut TtsAssistant2,
     code_assistant: &mut CodeAssistant,
 ) -> ChatCompletionRequestMessage {
     // To save the current reply
@@ -67,27 +74,27 @@ async fn perform_request_with_streaming(
             let (state, event) = transition(state, token, &code_buffer);
             match (state, event) {
                 (State::Code, Event::Append) => {
-                    code_assistant.push(&token.chars().collect::<Vec<_>>());
+                    code_assistant.push(&char_vec!(token));
                     tmp_buffer.clear();
                 }
                 (State::Code, Event::Flush) => {
-                    code_assistant.push(&token.chars().collect::<Vec<_>>());
+                    code_assistant.push(&char_vec!(token));
                     code_assistant.flush();
                     code_buffer.clear();
                 }
                 (State::Code, _) => {}
 
                 (State::Prose, Event::Append) => {
-                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
+                    speech_assistant.push(&char_vec!(token));
                     tmp_buffer.clear();
                 }
                 (State::Prose, Event::Flush) => {
-                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
-                    speech_assistant.flush();
+                    speech_assistant.push(&char_vec!(token));
+                    speech_assistant.flush().await;
                     speech_buffer.clear();
                 }
                 (State::Prose, _) => {
-                    speech_assistant.push(&token.chars().collect::<Vec<_>>());
+                    speech_assistant.push(&char_vec!(token));
                 }
 
                 (State::MaybeCode, Event::AppendTmp) => {
@@ -100,7 +107,7 @@ async fn perform_request_with_streaming(
 
     // Flush any remaining buffer
     code_assistant.flush();
-    speech_assistant.flush();
+    speech_assistant.flush().await;
 
     // Append the current reply to the chat history and clear the current reply
     ChatCompletionRequestMessage {
@@ -133,7 +140,7 @@ async fn chat() {
     }];
 
     // Assistants
-    let mut speech_assistant = TtsAssistant::default();
+    let mut speech_assistant = TtsAssistant2::default();
     let mut code_assistant = CodeAssistant::new(home_dir);
     let mut stt =
         stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-base.en.bin".to_string());
