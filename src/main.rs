@@ -2,10 +2,10 @@
 
 mod code_assistant;
 mod stt_assistant;
-mod tts_assistant;
 mod traits;
-mod tty_input;
+mod tts_assistant;
 mod tts_assistant2;
+mod tty_input;
 
 use async_openai::types::ChatCompletionRequestMessage;
 use async_openai::types::CreateChatCompletionRequestArgs;
@@ -143,7 +143,7 @@ async fn chat() {
     let mut speech_assistant = TtsAssistant2::default();
     let mut code_assistant = CodeAssistant::new(home_dir);
     let mut stt =
-        stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-base.en.bin".to_string());
+        stt_assistant::Stt::new("/Users/raimibinkarim/Desktop/ggml-tiny.en.bin".to_string());
 
     // Turn-based
     loop {
@@ -229,19 +229,11 @@ mod tests {
             (State::Code, Event::Append)
         );
         assert_eq!(
-            transition(
-                State::Code,
-                "`",
-                "```code``".chars().collect::<Vec<_>>().as_slice()
-            ),
+            transition(State::Code, "`", char_vec!("```code``").as_slice()),
             (State::Prose, Event::Flush)
         );
         assert_eq!(
-            transition(
-                State::Code,
-                "``",
-                "```code`".chars().collect::<Vec<_>>().as_slice()
-            ),
+            transition(State::Code, "``", char_vec!("```code`").as_slice()),
             (State::Prose, Event::Flush)
         );
     }

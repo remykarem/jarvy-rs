@@ -8,7 +8,7 @@ use whisper_rs::{convert_stereo_to_mono_audio, FullParams, SamplingStrategy, Whi
 use crate::traits::GetInput;
 
 const VOLUME_THRESHOLD: f32 = 0.05;
-const SILENCE_DURATION: Duration = Duration::from_secs(2);
+const SILENCE_DURATION: Duration = Duration::from_secs(1);
 const AUDIO_BUFFER: usize = 512;
 const OUTPUT_SAMPLE_RATE: usize = 16_000;  // as required by Whisper
 
@@ -151,7 +151,6 @@ impl Stt {
         let ctx = WhisperContext::new(&path_to_model).expect("failed to load model");
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-        params.set_n_threads(1);
         params.set_translate(true);
         params.set_language(Some("en"));
         params.set_print_special(false);

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, io::Cursor};
+use std::{collections::VecDeque, io::Cursor, env};
 
 use reqwest::Client;
 use rodio::{Decoder, OutputStream, Sink};
@@ -40,7 +40,7 @@ impl TtsAssistant2 {
     async fn say(&mut self, sentence: &str) {
         let api_url = "https://api.elevenlabs.io/v1/text-to-speech/";
         let voice_id = "EXAVITQu4vr4xnSDxMaL";
-        let api_key = "";
+        let api_key = env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY must be set");
 
         let client = Client::new();
 
@@ -54,7 +54,7 @@ impl TtsAssistant2 {
         };
         let response = client
             .post(&format!("{}{}", api_url, voice_id))
-            .header(api_key, api_key)
+            .header("xi-api-key", api_key)
             .json(&request_body)
             .send()
             .await.unwrap();
